@@ -2,7 +2,6 @@
 #define CLICK_EMPOWERPACKET_HH
 #include <clicknet/wifi.h>
 #include <elements/wifi/transmissionpolicies.hh>
-#include <endian.h>
 #include "empowerlvapmanager.hh"
 CLICK_DECLS
 
@@ -46,6 +45,10 @@ enum empower_packet_types {
     EMPOWER_PT_SUMMARY_TRIGGER = 0x23,     		// ac -> wtp
     EMPOWER_PT_DEL_SUMMARY_TRIGGER = 0x24, 		// ac -> wtp
 
+    EMPOWER_PT_ADD_BUSYNESS_TRIGGER = 0x38, 	// ac -> wtp
+    EMPOWER_PT_BUSYNESS_TRIGGER = 0x39,     	// ac -> wtp
+    EMPOWER_PT_DEL_BUSYNESS_TRIGGER = 0x40, 	// ac -> wtp
+
     // Channel Quality Maps
     EMPOWER_PT_UCQM_REQUEST = 0x25,     		// ac -> wtp
     EMPOWER_PT_UCQM_RESPONSE = 0x26,    		// wtp -> ac
@@ -66,12 +69,9 @@ enum empower_packet_types {
     EMPOWER_PT_TXP_COUNTERS_REQUEST = 0x34,		// ac -> wtp
     EMPOWER_PT_TXP_COUNTERS_RESPONSE = 0x35,	// wtp -> ac
 
-    // Channel Quality Map Links
-    EMPOWER_PT_UCQM_LINKS_REQUEST = 0x36,		// ac -> wtp
-    EMPOWER_PT_UCQM_LINKS_RESPONSE = 0x37,		// wtp -> ac
-
-    EMPOWER_PT_NCQM_LINKS_REQUEST = 0x38,		// ac -> wtp
-    EMPOWER_PT_NCQM_LINKS_RESPONSE = 0x39,		// wtp -> ac
+    // Busyness
+    EMPOWER_PT_BUSYNESS_REQUEST = 0x36,			// ac -> wtp
+    EMPOWER_PT_BUSYNESS_RESPONSE = 0x37,		// wtp -> ac
 
 };
 
@@ -80,17 +80,17 @@ struct empower_header {
   private:
     uint8_t  _version; /* see protocol version */
     uint8_t  _type;    /* see protocol type */
-    uint16_t _length;  /* including this header */
+    uint32_t _length;  /* including this header */
     uint32_t _seq;     /* sequence number */
   public:
     uint8_t  version()                    { return _version; }
     uint8_t  type()                       { return _type; }
-    uint16_t length()                     { return ntohs(_length); }
+    uint32_t length()                     { return ntohl(_length); }
     uint32_t seq()                        { return ntohl(_seq); }
     void     set_seq(uint32_t seq)        { _seq = htonl(seq); }
     void     set_version(uint8_t version) { _version = version; }
     void     set_type(uint8_t type)       { _type = type; }
-    void     set_length(uint16_t length)  { _length = htons(length); }
+    void     set_length(uint32_t length)  { _length = htonl(length); }
 } CLICK_SIZE_PACKED_ATTRIBUTE;
 
 /* hello packet format */
@@ -237,13 +237,40 @@ struct lvap_stats_entry {
     uint8_t  _rate; 	/* Rate in units of 500kbps or MCS index */
     uint16_t _flags;	/* Flags (empower_rate_flags) */
     uint32_t _prob; 	/* Probability [0-18000] */
-    uint32_t _cur_prob;	/* Probability [0-18000] */
+    uint32_t _cur_prob; 	/* Probability [0-18000] */
+
   public:
     void set_flags(uint16_t flags)    		{ _flags = htons(flags); }
     void set_flag(uint16_t f)        		{ _flags = htons(ntohs(_flags) | f); }
-    void set_rate(uint8_t rate)  		{ _rate = rate; }
-    void set_prob(uint32_t prob) 		{ _prob = htonl(prob); }
-    void set_cur_prob(uint32_t cur_prob)	{ _cur_prob = htonl(cur_prob); }
+    void set_rate(uint8_t rate)  			{ _rate = rate; }
+    void set_prob(uint32_t prob) 			{ _prob = htonl(prob); }
+    void set_cur_prob(uint32_t cur_prob) 	{ _cur_prob = htonl(cur_prob); }
+} CLICK_SIZE_PACKED_ATTRIBUTE;
+
+/* busyness request packet format */
+struct empower_busyness_request : public empower_header {
+private:
+  uint32_t _busyness_id; /* Module id (int) */
+  uint8_t  _hwaddr[6];	 /* EtherAddress */
+  uint8_t  _channel;	 /* WiFi Channel (int) */
+  uint8_t  _band;		 /* WiFi band (empower_band_types) */
+public:
+    uint32_t busyness_id()	{ return ntohl(_busyness_id); }
+    uint8_t channel()     	{ return _channel; }
+    uint8_t band()        	{ return _band; }
+    EtherAddress hwaddr() 	{ return EtherAddress(_hwaddr); }
+} CLICK_SIZE_PACKED_ATTRIBUTE;
+
+/* link stats response packet format */
+struct empower_busyness_response : public empower_header {
+private:
+  uint32_t _busyness_id;	/* Module id (int) */
+  uint8_t  _wtp[6];			/* EtherAddress */
+  uint32_t _prob; 			/* Probability [0-18000] */
+public:
+  void set_busyness_id(uint32_t busyness_id) 	{ _busyness_id = htonl(busyness_id); }
+  void set_wtp(EtherAddress wtp)				{ memcpy(_wtp, wtp.data(), 6); }
+  void set_prob(uint32_t prob) 					{ _prob = htonl(prob); }
 } CLICK_SIZE_PACKED_ATTRIBUTE;
 
 /* channel quality map request packet format */
@@ -478,6 +505,52 @@ public:
     void set_ur_mcast_count(uint8_t ur_mcast_count) 	{ _ur_mcast_count = ur_mcast_count; }
 } CLICK_SIZE_PACKED_ATTRIBUTE;
 
+/* add busyness packet format */
+struct empower_add_busyness_trigger: public empower_header {
+private:
+    uint32_t _trigger_id;	/* Module id (int) */
+    uint8_t  _hwaddr[6];	/* EtherAddress */
+    uint8_t  _channel;		/* WiFi channel (int) */
+    uint8_t  _band;			/* WiFi band (empower_band_types) */
+    uint8_t  _relation;   	/* Relation (relation_t) */
+    uint32_t _value;		/* Busyness value between 0 and 18000 */
+    uint16_t _period;		/* Reporting period in ms (int) */
+public:
+    EtherAddress hwaddr() { return EtherAddress(_hwaddr); }
+    uint8_t channel()     { return _channel; }
+    uint8_t band()        { return _band; }
+    uint32_t trigger_id() { return ntohl(_trigger_id); }
+    uint8_t relation()    { return _relation; }
+    uint32_t value()      { return ntohl(_value); }
+    uint16_t period()     { return ntohs(_period); }
+} CLICK_SIZE_PACKED_ATTRIBUTE;
+
+/* del busyness trigger packet format */
+struct empower_del_busyness_trigger: public empower_header {
+private:
+    uint32_t _trigger_id; /* Module id (int) */
+public:
+    uint32_t trigger_id() { return ntohl(_trigger_id); }
+} CLICK_SIZE_PACKED_ATTRIBUTE;
+
+/* busyness trigger packet format */
+struct empower_busyness_trigger: public empower_header {
+private:
+    uint32_t _trigger_id; 	/* Module id (int) */
+    uint8_t  _wtp[6];		/* EtherAddress */
+    uint8_t  _hwaddr[6];	/* EtherAddress */
+    uint8_t  _channel;		/* WiFi channel (int) */
+    uint8_t  _band;			/* WiFi band (empower_band_types) */
+    uint32_t  _current;     /* Busyness value between 0 and 18000 */
+public:
+    void set_wtp(EtherAddress wtp)          { memcpy(_wtp, wtp.data(), 6); }
+    void set_band(uint8_t band)             { _band = band; }
+    void set_channel(uint8_t channel)       { _channel = channel; }
+    void set_hwaddr(EtherAddress hwaddr)    { memcpy(_hwaddr, hwaddr.data(), 6); }
+    void set_current(uint32_t current)      { _current = htonl(current); }
+    void set_trigger_id(int32_t trigger_id) { _trigger_id = htonl(trigger_id); }
+} CLICK_SIZE_PACKED_ATTRIBUTE;
+
 /* add rssi trigger packet format */
 struct empower_add_rssi_trigger: public empower_header {
 private:
@@ -591,16 +664,16 @@ public:
 struct empower_add_vap : public empower_header {
 private:
     uint8_t _hwaddr[6];		/* EtherAddress */
-    uint8_t _channel;			/* WiFi channel (int) */
-    uint8_t _band;				/* WiFi band (empower_band_types) */
+    uint8_t _channel;		/* WiFi channel (int) */
+    uint8_t _band;			/* WiFi band (empower_band_types) */
     uint8_t _net_bssid[6];	/* EtherAddress */
-    char    _ssid[];			/* SSID (String) */
+    char    _ssid[];		/* SSID (String) */
 public:
     uint8_t      band()      { return _band; }
     uint8_t      channel()   { return _channel; }
     EtherAddress hwaddr()    { return EtherAddress(_hwaddr); }
     EtherAddress net_bssid() { return EtherAddress(_net_bssid); }
-    String       ssid()      { int len = length() - 22; return String((char *) _ssid, WIFI_MIN(len, WIFI_NWID_MAXSIZE)); }
+    String       ssid()      { int len = length() - 24; return String((char *) _ssid, WIFI_MIN(len, WIFI_NWID_MAXSIZE)); }
 } CLICK_SIZE_PACKED_ATTRIBUTE;
 
 /* del vap packet format */

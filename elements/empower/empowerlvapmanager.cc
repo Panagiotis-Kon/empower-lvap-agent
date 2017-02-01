@@ -3,7 +3,6 @@
  * Roberto Riggio
  *
  * Copyright (c) 2013 CREATE-NET
-
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
  * to deal in the Software without restriction, subject to the conditions
@@ -151,6 +150,37 @@ int EmpowerLVAPManager::configure(Vector<String> &conf,
 	}
 
 	return res;
+
+}
+
+void EmpowerLVAPManager::send_busyness_trigger(uint32_t trigger_id, uint32_t iface, uint32_t current) {
+
+    WritablePacket *p = Packet::make(sizeof(empower_busyness_trigger));
+
+    ResourceElement* re = iface_to_element(iface);
+
+    if (!p) {
+        click_chatter("%{element} :: %s :: cannot make packet!",
+                      this,
+                      __func__);
+        return;
+    }
+
+    memset(p->data(), 0, p->length());
+
+    empower_busyness_trigger*request = (struct empower_busyness_trigger *) (p->data());
+    request->set_version(_empower_version);
+    request->set_length(sizeof(empower_busyness_trigger));
+    request->set_type(EMPOWER_PT_BUSYNESS_TRIGGER);
+    request->set_seq(get_next_seq());
+    request->set_trigger_id(trigger_id);
+    request->set_wtp(_wtp);
+    request->set_channel(re->_channel);
+    request->set_band(re->_band);
+    request->set_hwaddr(re->_hwaddr);
+    request->set_current(current);
+
+    output(0).push(p);
 
 }
 
@@ -572,6 +602,46 @@ void EmpowerLVAPManager::send_img_response(int type, uint32_t graph_id,
 
 }
 
+void EmpowerLVAPManager::send_busyness_response(uint32_t busyness_id, EtherAddress hwaddr, uint8_t channel, empower_bands_types band) {
+
+	int iface_id = element_to_iface(hwaddr, channel, band);
+
+	if (iface_id == -1) {
+		click_chatter("%{element} :: %s :: invalid resource element (%s, %u, %u)!",
+					  this,
+					  __func__,
+					  hwaddr.unparse().c_str(),
+					  channel,
+					  band);
+		return;
+	}
+
+	BusynessInfo *nfo = _ers->busyness.get_pointer(iface_id);
+	int len = sizeof(empower_busyness_response);
+	WritablePacket *p = Packet::make(len);
+
+	if (!p) {
+		click_chatter("%{element} :: %s :: cannot make packet!",
+					  this,
+					  __func__);
+		return;
+	}
+
+	memset(p->data(), 0, p->length());
+
+	empower_busyness_response *busy = (struct empower_busyness_response *) (p->data());
+	busy->set_version(_empower_version);
+	busy->set_length(len);
+	busy->set_type(EMPOWER_PT_BUSYNESS_RESPONSE);
+	busy->set_seq(get_next_seq());
+	busy->set_busyness_id(busyness_id);
+	busy->set_wtp(_wtp);
+	busy->set_prob((uint32_t) nfo->_sma_busyness->avg());
+
+	output(0).push(p);
+
+}
+
 void EmpowerLVAPManager::send_summary_trigger(SummaryTrigger * summary) {
 
 	int len = sizeof(empower_summary_trigger) + summary->_frames.size() * sizeof(summary_entry);
@@ -674,11 +744,20 @@ void EmpowerLVAPManager::send_lvap_stats_response(EtherAddress lvap, uint32_t lv
 
 void EmpowerLVAPManager::send_counters_response(EtherAddress sta, uint32_t counters_id) {
 
-	EmpowerStationState ess = _lvaps.get(sta);
+	//EmpowerStationState ess = _lvaps.get(sta);
+	TxPolicyInfo * txp = get_txp(sta);
+
+	if (!txp) {
+		click_chatter("%{element} :: %s :: unable to find TXP for station %s!",
+					  this,
+					  __func__,
+					  sta.unparse().c_str());
+		return;
+	}
 
 	int len = sizeof(empower_counters_response);
-	len += ess._tx.size() * 6; // the tx samples
-	len += ess._rx.size() * 6; // the rx samples
+	len += txp->_tx.size() * 6; // the tx samples
+	len += txp->_rx.size() * 6; // the rx samples
 
 	WritablePacket *p = Packet::make(len);
 
@@ -698,16 +777,16 @@ void EmpowerLVAPManager::send_counters_response(EtherAddress sta, uint32_t count
 	counters->set_seq(get_next_seq());
 	counters->set_counters_id(counters_id);
 	counters->set_wtp(_wtp);
-	counters->set_sta(ess._sta);
-	counters->set_nb_tx(ess._tx.size());
-	counters->set_nb_rx(ess._rx.size());
+	counters->set_sta(sta);
+	counters->set_nb_tx(txp->_tx.size());
+	counters->set_nb_rx(txp->_rx.size());
 
 	uint8_t *ptr = (uint8_t *) counters;
 	ptr += sizeof(struct empower_counters_response);
 
 	uint8_t *end = ptr + (len - sizeof(struct empower_counters_response));
 
-	for (CBytesIter iter = ess._tx.begin(); iter.live(); iter++) {
+	for (CBytesIter iter = txp->_tx.begin(); iter.live(); iter++) {
 		assert (ptr <= end);
 		counters_entry *entry = (counters_entry *) ptr;
 		entry->set_size(iter.key());
@@ -715,7 +794,7 @@ void EmpowerLVAPManager::send_counters_response(EtherAddress sta, uint32_t count
 		ptr += sizeof(struct counters_entry);
 	}
 
-	for (CBytesIter iter = ess._rx.begin(); iter.live(); iter++) {
+	for (CBytesIter iter = txp->_rx.begin(); iter.live(); iter++) {
 		assert (ptr <= end);
 		counters_entry *entry = (counters_entry *) ptr;
 		entry->set_size(iter.key());
@@ -752,6 +831,7 @@ void EmpowerLVAPManager::send_txp_counters_response(uint32_t counters_id, EtherA
 						  __func__);
 			return;
 		}
+
 		memset(p->data(), 0, p->length());
 		empower_txp_counters_response *counters = (struct empower_txp_counters_response *) (p->data());
 		counters->set_version(_empower_version);
@@ -760,7 +840,7 @@ void EmpowerLVAPManager::send_txp_counters_response(uint32_t counters_id, EtherA
 		counters->set_seq(get_next_seq());
 		counters->set_counters_id(counters_id);
 		counters->set_wtp(_wtp);
-		counters->set_nb_tx(tx_policy->_tx.size());
+		counters->set_nb_tx(0);
 		output(0).push(p);
 		return;
 	}
@@ -844,7 +924,7 @@ void EmpowerLVAPManager::send_caps() {
 
 	uint8_t *end = ptr + (len - sizeof(struct empower_caps));
 
-	for (IfIter iter = elements().begin(); iter.live(); iter++) {
+	for (IfIter iter = _elements_to_ifaces.begin(); iter.live(); iter++) {
 		assert (ptr <= end);
 		resource_elements_entry *entry = (resource_elements_entry *) ptr;
 		entry->set_hwaddr(iter.key()._hwaddr);
@@ -1112,9 +1192,25 @@ int EmpowerLVAPManager::handle_set_port(Packet *p, uint32_t offset) {
 
 }
 
+int EmpowerLVAPManager::handle_add_busyness_trigger(Packet *p, uint32_t offset) {
+	struct empower_add_busyness_trigger *q = (struct empower_add_busyness_trigger *) (p->data() + offset);
+	EtherAddress hwaddr = q->hwaddr();
+	empower_bands_types band = (empower_bands_types) q->band();
+	uint8_t channel = q->channel();
+	int iface = element_to_iface(hwaddr, channel, band);
+	_ers->add_busyness_trigger(iface, q->trigger_id(), static_cast<empower_trigger_relation>(q->relation()), q->value(), q->period());
+	return 0;
+}
+
+int EmpowerLVAPManager::handle_del_busyness_trigger(Packet *p, uint32_t offset) {
+	struct empower_del_busyness_trigger *q = (struct empower_del_busyness_trigger *) (p->data() + offset);
+	_ers->del_busyness_trigger(q->trigger_id());
+	return 0;
+}
+
 int EmpowerLVAPManager::handle_add_rssi_trigger(Packet *p, uint32_t offset) {
 	struct empower_add_rssi_trigger *q = (struct empower_add_rssi_trigger *) (p->data() + offset);
-	_ers->add_rssi_trigger(q->sta(), q->trigger_id(), static_cast<empower_rssi_trigger_relation>(q->relation()), q->value(), q->period());
+	_ers->add_rssi_trigger(q->sta(), q->trigger_id(), static_cast<empower_trigger_relation>(q->relation()), q->value(), q->period());
 	return 0;
 }
 
@@ -1268,6 +1364,15 @@ int EmpowerLVAPManager::handle_counters_request(Packet *p, uint32_t offset) {
 	return 0;
 }
 
+int EmpowerLVAPManager::handle_busyness_request(Packet *p, uint32_t offset) {
+	struct empower_busyness_request *q = (struct empower_busyness_request *) (p->data() + offset);
+	EtherAddress hwaddr = q->hwaddr();
+	empower_bands_types band = (empower_bands_types) q->band();
+	uint8_t channel = q->channel();
+	send_busyness_response(q->busyness_id(), hwaddr, channel, band);
+	return 0;
+}
+
 int EmpowerLVAPManager::handle_uimg_request(Packet *p, uint32_t offset) {
 	struct empower_cqm_request *q = (struct empower_cqm_request *) (p->data() + offset);
 	EtherAddress hwaddr = q->hwaddr();
@@ -1353,6 +1458,12 @@ void EmpowerLVAPManager::push(int, Packet *p) {
 		case EMPOWER_PT_DEL_RSSI_TRIGGER:
 			handle_del_rssi_trigger(p, offset);
 			break;
+		case EMPOWER_PT_ADD_BUSYNESS_TRIGGER:
+			handle_add_busyness_trigger(p, offset);
+			break;
+		case EMPOWER_PT_DEL_BUSYNESS_TRIGGER:
+			handle_del_busyness_trigger(p, offset);
+			break;
 		case EMPOWER_PT_ADD_SUMMARY_TRIGGER:
 			handle_add_summary_trigger(p, offset);
 			break;
@@ -1370,6 +1481,9 @@ void EmpowerLVAPManager::push(int, Packet *p) {
 			break;
 		case EMPOWER_PT_LVAP_STATS_REQUEST:
 			handle_lvap_stats_request(p, offset);
+			break;
+		case EMPOWER_PT_BUSYNESS_REQUEST:
+			handle_busyness_request(p, offset);
 			break;
 		default:
 			click_chatter("%{element} :: %s :: Unknown packet type: %d",
@@ -1605,9 +1719,10 @@ String EmpowerLVAPManager::read_handler(Element *e, void *thunk) {
 	case H_BYTES: {
 		StringAccum sa;
 		for (LVAPIter it = td->lvaps()->begin(); it.live(); it++) {
+			TxPolicyInfo *txp = td->get_txp(it.key());
 			sa << "!" << it.key().unparse() << "\n";
 			sa << "!TX\n";
-			CBytes tx = it.value()._tx;
+			CBytes tx = txp->_tx;
 			Vector<int> lens_tx;
 			for (CBytesIter iter = tx.begin(); iter.live(); iter++) {
 				lens_tx.push_back(iter.key());
@@ -1618,7 +1733,7 @@ String EmpowerLVAPManager::read_handler(Element *e, void *thunk) {
 				sa << itr.key() << " " << itr.value() << "\n";
 			}
 			sa << "!RX\n";
-			CBytes rx = it.value()._rx;
+			CBytes rx = txp->_rx;
 			Vector<int> lens_rx;
 			for (CBytesIter iter = rx.begin(); iter.live(); iter++) {
 				lens_rx.push_back(iter.key());
@@ -1707,11 +1822,10 @@ int EmpowerLVAPManager::write_handler(const String &in_s, Element *e,
 		}
 		// send tx policies
 		for (REIter it_re = f->_ifaces_to_elements.begin(); it_re.live(); it_re++) {
-			int iface = it_re.key();
-			TransmissionPolicies * _tx_policies = f->rcs()->at(iface)->tx_policies();
-			for (TxTableIter it_txp = _tx_policies->tx_table()->begin(); it_txp.live(); it_txp++) {
+			int iface_id = it_re.key();
+			for (TxTableIter it_txp = f->get_tx_policies(iface_id)->tx_table()->begin(); it_txp.live(); it_txp++) {
 				EtherAddress sta = it_txp.key();
-				f->send_status_port(sta, iface, it_re.value()._hwaddr, it_re.value()._channel, it_re.value()._band);
+				f->send_status_port(sta, iface_id, it_re.value()._hwaddr, it_re.value()._channel, it_re.value()._band);
 			}
 		}
 		break;
@@ -1738,4 +1852,4 @@ void EmpowerLVAPManager::add_handlers() {
 
 CLICK_ENDDECLS
 EXPORT_ELEMENT(EmpowerLVAPManager)
-ELEMENT_REQUIRES(userlevel)
+ELEMENT_REQUIRES(userlevel EmpowerRXStats)

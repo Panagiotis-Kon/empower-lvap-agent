@@ -1,8 +1,8 @@
 /*
  * empowerrxstats.{cc,hh} -- tracks rx stats
- * John Bicket, Roberto Riggio
+ * Roberto Riggio, Akhila Rao
  *
- * Copyright (c) 2003 Massachusetts Institute of Technology
+ * Copyright (c) 2003 CREATE-NET
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -31,8 +31,10 @@ CLICK_DECLS
 void send_summary_trigger_callback(Timer *timer, void *data) {
 	// send summary
 	SummaryTrigger *summary = (SummaryTrigger *) data;
+	summary->_ers->lock.acquire_write();
 	summary->_el->send_summary_trigger(summary);
 	summary->_sent++;
+	summary->_ers->lock.release_write();
 	if (summary->_limit > 0 && summary->_sent >= (unsigned) summary->_limit) {
 		summary->_ers->del_summary_trigger(summary->_trigger_id);
 		return;
@@ -44,7 +46,7 @@ void send_summary_trigger_callback(Timer *timer, void *data) {
 void send_rssi_trigger_callback(Timer *timer, void *data) {
 	// process triggers
 	RssiTrigger *rssi = (RssiTrigger *) data;
-	rssi->_ers->lock.acquire_read();
+	rssi->_ers->lock.acquire_write();
 	for (NTIter iter = rssi->_ers->stas.begin(); iter.live(); iter++) {
 		DstInfo *nfo = &iter.value();
 		// not matching the address
@@ -59,15 +61,37 @@ void send_rssi_trigger_callback(Timer *timer, void *data) {
 			rssi->_dispatched = false;
 		}
 	}
-	rssi->_ers->lock.release_read();
+	rssi->_ers->lock.release_write();
 	// re-schedule the timer
 	timer->schedule_after_msec(rssi->_period);
 }
 
+void send_busyness_trigger_callback(Timer *timer, void *data) {
+	// process triggers
+	BusynessTrigger *busyness = (BusynessTrigger *) data;
+	busyness->_ers->lock.acquire_write();
+	for (CBFTIter iter = busyness->_ers->busyness.begin(); iter.live(); iter++) {
+		BusynessInfo *nfo = &iter.value();
+		// not matching the address
+		if (nfo->_iface_id != busyness->_iface_id) {
+			continue;
+		}
+		// check if condition matches
+		if (busyness->matches(nfo) && !busyness->_dispatched) {
+			busyness->_el->send_busyness_trigger(busyness->_trigger_id, nfo->_iface_id, nfo->_sma_busyness->avg());
+			busyness->_dispatched = true;
+		} else if (!busyness->matches(nfo) && busyness->_dispatched) {
+			busyness->_dispatched = false;
+		}
+	}
+	busyness->_ers->lock.release_write();
+	// re-schedule the timer
+	timer->schedule_after_msec(busyness->_period);
+}
+
 EmpowerRXStats::EmpowerRXStats() :
-		_el(0), _timer(this), _signal_offset(0), _period(1000),
-		_sma_period(13), _max_silent_window_count(10), _rssi_threshold(-70),
-		_debug(false) {
+		_el(0), _timer(this), _signal_offset(0), _period(500),
+		_sma_period(13), _max_silent_window_count(10), _debug(false) {
 
 }
 
@@ -120,14 +144,21 @@ void EmpowerRXStats::run_timer(Timer *) {
 			++iter;
 		}
 	}
-	// process links
-	for (CIter iter = links.begin(); iter.live();) {
-		// Update estimator
-		CqmLink *nfo = &iter.value();
-		nfo->estimator();
+	// process busyness
+	for (CBFTIter iter = busyness.begin(); iter.live();) {
+		// Update busyness
+		BusynessInfo *nfo = &iter.value();
+		nfo->update();
+		// print busyness table
+		if (_debug) {
+			click_chatter("%{element} :: %s :: %s",
+						  this,
+						  __func__,
+						  nfo->unparse().c_str());
+		}
 		// Delete stale entries
-		if (nfo->silentWindowCount> _max_silent_window_count) {
-			iter = links.erase(iter);
+		if (nfo->_silent_window_count > _max_silent_window_count) {
+			iter = busyness.erase(iter);
 		} else {
 			++iter;
 		}
@@ -165,9 +196,8 @@ EmpowerRXStats::simple_action(Packet *p) {
 	int retry = w->i_fc[1] & WIFI_FC1_RETRY;
 	bool station = false;
 
-	// Discard frames that do not have sequence numbers OR are retry frames
-	// These conditions are to enable using the sequence number to estimate packet delivery rate
-	if (retry == 1 || type == WIFI_FC0_TYPE_CTL) {
+	// Discard frames that do not have sequence numbers
+	if (type == WIFI_FC0_TYPE_CTL) {
 		return p;
 	}
 
@@ -221,14 +251,10 @@ EmpowerRXStats::simple_action(Packet *p) {
 	// create frame meta-data
 	Frame *frame = new Frame(ra, ta, ceh->tsft, ceh->flags, w->i_seq, rssi, ceh->rate, type, subtype, p->length(), retry, station, iface_id);
 
-	if (_debug) {
-		click_chatter("%{element} :: %s :: %s", this, __func__, frame->unparse().c_str());
-	}
-
 	lock.acquire_write();
 
 	update_neighbor(frame);
-	update_link_table(frame);
+	update_channel_busyness_time(frame);
 
 	// check if frame meta-data should be saved
 	for (DTIter qi = _summary_triggers.begin(); qi != _summary_triggers.end(); qi++) {
@@ -246,23 +272,16 @@ EmpowerRXStats::simple_action(Packet *p) {
 
 }
 
-void EmpowerRXStats::update_link_table(Frame *frame) {
+void EmpowerRXStats::update_channel_busyness_time(Frame *frame) {
 
-	// Update channel quality map
-	CqmLink *nfo;
-	nfo = links.get_pointer(frame->_ta);
+	// Update channel busyness time
+	BusynessInfo *nfo;
+	nfo = busyness.get_pointer(frame->_iface_id);
 	if (!nfo) {
-		links[frame->_ta] = CqmLink();
-		nfo = links.get_pointer(frame->_ta);
-		nfo->senderType = frame->_station ? 0 : 1;
-		nfo->sourceAddr = frame->_ta;
-		nfo->lastEstimateTime = Timestamp::now();
-		nfo->currentTime = Timestamp::now();
-		nfo->lastSeqNum = frame->_seq - 1;
-		nfo->currentSeqNum = frame->_seq;
-		nfo->xi = 0;
-		nfo->ifaceId = frame->_iface_id;
-		nfo->rssiThreshold = _rssi_threshold;
+		busyness[frame->_iface_id] = BusynessInfo();
+		nfo = busyness.get_pointer(frame->_iface_id);
+		nfo->_iface_id = frame->_iface_id;
+		nfo->_sma_busyness = new SMA(7);
 	}
 
 	// Add sample
@@ -301,7 +320,35 @@ void EmpowerRXStats::update_neighbor(Frame *frame) {
 
 }
 
-void EmpowerRXStats::add_rssi_trigger(EtherAddress eth, uint32_t trigger_id, empower_rssi_trigger_relation rel, int val, uint16_t period) {
+void EmpowerRXStats::add_busyness_trigger(int iface_id, uint32_t trigger_id, empower_trigger_relation rel, int val, uint16_t period) {
+    BusynessTrigger * busyness = new BusynessTrigger(iface_id, trigger_id, rel, val, false, period, _el, this);
+    for (BTIter qi = _busyness_triggers.begin(); qi != _busyness_triggers.end(); qi++) {
+        if (*busyness== **qi) {
+            click_chatter("%{element} :: %s :: trigger already defined (%s), setting sent to false",
+                          this,
+                          __func__,
+                          busyness->unparse().c_str());
+            (*qi)->_dispatched = false;
+            return;
+        }
+    }
+    busyness->_trigger_timer->assign(&send_busyness_trigger_callback, (void *) busyness);
+    busyness->_trigger_timer->initialize(this);
+    busyness->_trigger_timer->schedule_now();
+    _busyness_triggers.push_back(busyness);
+}
+
+void EmpowerRXStats::del_busyness_trigger(uint32_t trigger_id) {
+    for (BTIter qi = _busyness_triggers.begin(); qi != _busyness_triggers.end(); qi++) {
+        if ((*qi)->_trigger_id == trigger_id) {
+            (*qi)->_trigger_timer->clear();
+            _busyness_triggers.erase(qi);
+            break;
+        }
+    }
+}
+
+void EmpowerRXStats::add_rssi_trigger(EtherAddress eth, uint32_t trigger_id, empower_trigger_relation rel, int val, uint16_t period) {
 	RssiTrigger * rssi = new RssiTrigger(eth, trigger_id, rel, val, false, period, _el, this);
 	for (RTIter qi = _rssi_triggers.begin(); qi != _rssi_triggers.end(); qi++) {
 		if (*rssi== **qi) {
@@ -330,6 +377,11 @@ void EmpowerRXStats::del_rssi_trigger(uint32_t trigger_id) {
 }
 
 void EmpowerRXStats::clear_triggers() {
+	// clear busyness triggers
+	for (BTIter qi = _busyness_triggers.begin(); qi != _busyness_triggers.end(); qi++) {
+		(*qi)->_trigger_timer->clear();
+	}
+	_busyness_triggers.clear();
 	// clear rssi triggers
 	for (RTIter qi = _rssi_triggers.begin(); qi != _rssi_triggers.end(); qi++) {
 		(*qi)->_trigger_timer->clear();
@@ -374,12 +426,14 @@ void EmpowerRXStats::del_summary_trigger(uint32_t summary_id) {
 enum {
 	H_DEBUG,
 	H_NEIGHBORS,
-	H_LINKS,
+	H_BUSYNESS,
 	H_RESET,
 	H_SIGNAL_OFFSET,
-	H_MATCHES,
+	H_RSSI_MATCHES,
+	H_BUSYNESS_MATCHES,
 	H_RSSI_TRIGGERS,
-	H_SUMMARY_TRIGGERS
+	H_SUMMARY_TRIGGERS,
+	H_BUSYNESS_TRIGGERS
 };
 
 String EmpowerRXStats::read_handler(Element *e, void *thunk) {
@@ -387,7 +441,7 @@ String EmpowerRXStats::read_handler(Element *e, void *thunk) {
 	EmpowerRXStats *td = (EmpowerRXStats *) e;
 
 	switch ((uintptr_t) thunk) {
-	case H_MATCHES: {
+	case H_RSSI_MATCHES: {
 		StringAccum sa;
 		for (RTIter qi = td->_rssi_triggers.begin(); qi != td->_rssi_triggers.end(); qi++) {
 			for (NTIter iter = td->stas.begin(); iter.live(); iter++) {
@@ -400,6 +454,13 @@ String EmpowerRXStats::read_handler(Element *e, void *thunk) {
 					sa << "\n";
 				}
 			}
+		}
+		return sa.take_string();
+	}
+	case H_BUSYNESS_TRIGGERS: {
+		StringAccum sa;
+		for (BTIter qi = td->_busyness_triggers.begin(); qi != td->_busyness_triggers.end(); qi++) {
+			sa << (*qi)->unparse() << "\n";
 		}
 		return sa.take_string();
 	}
@@ -429,10 +490,10 @@ String EmpowerRXStats::read_handler(Element *e, void *thunk) {
 		}
 		return sa.take_string();
 	}
-	case H_LINKS: {
+	case H_BUSYNESS: {
 		StringAccum sa;
-		for (CIter iter = td->links.begin(); iter.live(); iter++) {
-			CqmLink *nfo = &iter.value();
+		for (CBFTIter iter = td->busyness.begin(); iter.live(); iter++) {
+			BusynessInfo *nfo = &iter.value();
 			sa << nfo->unparse();
 		}
 		return sa.take_string();
@@ -478,10 +539,12 @@ int EmpowerRXStats::write_handler(const String &in_s, Element *e, void *vparam,
 
 void EmpowerRXStats::add_handlers() {
 	add_read_handler("neighbors", read_handler, (void *) H_NEIGHBORS);
-	add_read_handler("links", read_handler, (void *) H_LINKS);
+	add_read_handler("busyness", read_handler, (void *) H_BUSYNESS);
 	add_read_handler("summary_triggers", read_handler, (void *) H_SUMMARY_TRIGGERS);
-	add_read_handler("matches", read_handler, (void *) H_MATCHES);
+	add_read_handler("rssi_matches", read_handler, (void *) H_RSSI_MATCHES);
+	add_read_handler("busyness_matches", read_handler, (void *) H_BUSYNESS_MATCHES);
 	add_read_handler("rssi_triggers", read_handler, (void *) H_RSSI_TRIGGERS);
+	add_read_handler("busyness_triggers", read_handler, (void *) H_BUSYNESS_TRIGGERS);
 	add_read_handler("debug", read_handler, (void *) H_DEBUG);
 	add_read_handler("signal_offset", read_handler, (void *) H_SIGNAL_OFFSET);
 	add_write_handler("signal_offset", write_handler, (void *) H_SIGNAL_OFFSET);
@@ -489,6 +552,5 @@ void EmpowerRXStats::add_handlers() {
 }
 
 EXPORT_ELEMENT(EmpowerRXStats)
-ELEMENT_REQUIRES(bitrate DstInfo Trigger SummaryTrigger RssiTrigger)
+ELEMENT_REQUIRES(bitrate DstInfo BusynessInfo Trigger SummaryTrigger RssiTrigger BusynessTrigger)
 CLICK_ENDDECLS
-
